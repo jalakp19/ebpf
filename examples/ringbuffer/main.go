@@ -19,11 +19,12 @@ import (
 )
 
 // $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -type event bpf ringbuffer.c -- -I../headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -target 386 -type event bpf ringbuffer.c -- -I../headers
 
 func main() {
 	// Name of the kernel function to trace.
-	fn := "sys_execve"
+	fn1 := "__sys_recvfrom"
+	fn2 := "__sys_sendto"
 
 	// Subscribe to signals for terminating the program.
 	stopper := make(chan os.Signal, 1)
@@ -44,11 +45,17 @@ func main() {
 	// Open a Kprobe at the entry point of the kernel function and attach the
 	// pre-compiled program. Each time the kernel function enters, the program
 	// will emit an event containing pid and command of the execved task.
-	kp, err := link.Kprobe(fn, objs.KprobeExecve, nil)
+	kp1, err := link.Kprobe(fn1, objs.KprobeRecvfrom, nil)
 	if err != nil {
 		log.Fatalf("opening kprobe: %s", err)
 	}
-	defer kp.Close()
+	defer kp1.Close()
+
+	kp2, err := link.Kprobe(fn2, objs.KprobeSendto, nil)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kp2.Close()
 
 	// Open a ringbuf reader from userspace RINGBUF map described in the
 	// eBPF C program.
@@ -88,7 +95,9 @@ func main() {
 			log.Printf("parsing ringbuf event: %s", err)
 			continue
 		}
-
-		log.Printf("pid: %d\tcomm: %s\n", event.Pid, unix.ByteSliceToString(event.Comm[:]))
+		
+		if event.Comm[0]==115 && event.Comm[1]==105 && event.Comm[2]==112 && event.Comm[3]==112 {
+			log.Printf("pid: %d\tfd: %d\tlen: %d\tcomm: %s\n%s \n\n", event.Pid, event.Fd, event.Len, unix.ByteSliceToString(event.Comm[:]), unix.ByteSliceToString(event.Msg[:]))
+		}
 	}
 }
