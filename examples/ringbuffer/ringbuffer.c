@@ -113,6 +113,10 @@ struct latdata {
 	u8 comm[80];
 	u64 delta_us;
 	u64 ts_us;
+	u16 sport;
+	u16 dport;
+	u32 saddr;
+	u32 daddr;
 };
 
 struct {
@@ -174,6 +178,12 @@ int BPF_KPROBE(tcp_rcv_state_process, struct sock *sk) {
 	bpf_get_current_comm(&ld.comm, 80);
 	ld.delta_us = delta / 1000;
 	ld.ts_us    = ts / 1000;
+
+	bpf_probe_read(&ld.dport, sizeof(ld.dport), &sk->__sk_common.skc_dport);
+	ld.dport = bpf_ntohs(ld.dport);
+	bpf_probe_read(&ld.sport, sizeof(ld.sport), &sk->__sk_common.skc_num);
+	bpf_probe_read(&ld.saddr, sizeof(ld.saddr), &sk->__sk_common.skc_rcv_saddr);
+	bpf_probe_read(&ld.daddr, sizeof(ld.daddr), &sk->__sk_common.skc_daddr);
 
 	bpf_perf_event_output(ctx, &latdatas, BPF_F_CURRENT_CPU, &ld, sizeof(ld));
 

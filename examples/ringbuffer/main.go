@@ -154,8 +154,15 @@ func readLoopTcpLatency(rd *perf.Reader) {
 			continue
 		}
 
-		if event.Comm[0] == 115 && event.Comm[1] == 105 && event.Comm[2] == 112 && event.Comm[3] == 112 {
-			log.Printf("Latency: %.2f\tcomm: %s", float64(event.DeltaUs)/1000.0, unix.ByteSliceToString(event.Comm[:]))
+		// Change the destination port number where the server is listening. Here, the port number is 5052
+		if event.Dport == 5052 {
+			log.Printf("%-15s %-16s %-6d -> %-16s %-5d\t Latency: %.2f\n",
+				unix.ByteSliceToString(event.Comm[:]),
+				intToIP(event.Saddr),
+				event.Sport,
+				intToIP(event.Daddr),
+				event.Dport,
+				float64(event.DeltaUs)/1000.0)
 		}
 	}
 }
@@ -207,13 +214,13 @@ func readLoopTcpClose(rd *ringbuf.Reader) {
 		}
 
 		if tcpevent.Comm[0] == 115 && tcpevent.Comm[1] == 105 && tcpevent.Comm[2] == 112 && tcpevent.Comm[3] == 112 {
-			log.Printf("%-15s %-6d -> %-15s %-6d %.2f %-6s",
+			log.Printf("%-15s %-15s %-6d -> %-15s %-6d \t RTT: %.2f",
+				unix.ByteSliceToString(tcpevent.Comm[:]),
 				intToIP(tcpevent.Saddr),
 				tcpevent.Sport,
 				intToIP(tcpevent.Daddr),
 				tcpevent.Dport,
 				float64(tcpevent.Srtt)/1000.0,
-				unix.ByteSliceToString(tcpevent.Comm[:]),
 			)
 		}
 	}
