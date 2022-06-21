@@ -74,6 +74,8 @@ struct sock_common {
  */
 struct sock {
 	struct sock_common __sk_common;
+	int sk_rcvbuf;
+	int sk_sndbuf;
 } __attribute__((preserve_access_index));
 
 /**
@@ -83,6 +85,10 @@ struct sock {
  */
 struct tcp_sock {
 	u32 srtt_us;
+	u32 rcv_nxt;
+	u32 snd_una;
+	u32 write_seq;
+	u32 copied_seq;
 } __attribute__((preserve_access_index));
 
 /**
@@ -144,6 +150,213 @@ struct bpf_map_def SEC("maps") start = {
 	.value_size  = sizeof(struct piddata),
 	.max_entries = 4096,
 };
+
+// Kernel read write buffer usage percentage
+
+static inline struct tcp_sock *tcp_sk(const struct sock *sk) {
+	return (struct tcp_sock *)sk;
+}
+
+struct stats_key {
+	char cgroup_name[129];
+};
+
+struct stats_value {
+	__u32 read_buffer_max_usage;
+	__u32 write_buffer_max_usage;
+};
+
+/*
+ * The `tcp_queue_stats` map is used to share with the userland program system-probe
+ * the statistics (max size of receive/send buffer)
+ */
+
+struct bpf_map_def SEC("maps") tcp_queue_stats = {
+	.type        = BPF_MAP_TYPE_PERCPU_HASH,
+	.key_size    = sizeof(struct stats_key),
+	.value_size  = sizeof(struct stats_value),
+	.max_entries = 1024,
+};
+
+/*
+ * the `who_recvmsg` and `who_sendmsg` maps are used to remind the sock pointer
+ * received as input parameter when we are in the kretprobe of tcp_recvmsg and tcp_sendmsg.
+ */
+struct bpf_map_def SEC("maps") who_recvmsg = {
+	.type        = BPF_MAP_TYPE_HASH,
+	.key_size    = sizeof(u64),
+	.value_size  = sizeof(struct sock *),
+	.max_entries = 128,
+};
+
+struct bpf_map_def SEC("maps") who_sendmsg = {
+	.type        = BPF_MAP_TYPE_HASH,
+	.key_size    = sizeof(u64),
+	.value_size  = sizeof(struct sock *),
+	.max_entries = 128,
+};
+
+struct queuedata {
+	u8 comm[80];
+	u32 read_buffer_max_usage;
+	u32 write_buffer_max_usage;
+	u64 rqueue_size;
+	u64 wqueue_size;
+	u64 rqueue;
+	u64 wqueue;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+} queuedatas SEC(".maps");
+
+const struct queuedata *unusedq __attribute__((unused));
+
+extern void *memset();
+
+struct task_struct {
+	struct css_set *cgroups;
+};
+
+struct css_set {
+	struct cgroup_subsys_state *subsys[2];
+};
+
+struct cgroup_subsys_state {
+	struct cgroup *cgroup;
+};
+
+struct cgroup {
+	struct kernfs_node *kn;
+};
+
+struct kernfs_node {
+	char *name;
+};
+
+static int get_cgroup_name(char *buf, int sz) {
+	memset(buf, 0, sz);
+
+	struct task_struct *cur_tsk = (struct task_struct *)bpf_get_current_task();
+
+	struct css_set *css_set;
+	if (bpf_probe_read(&css_set, sizeof(css_set), &cur_tsk->cgroups) < 0)
+		return -1;
+
+	struct cgroup_subsys_state *css;
+	if (bpf_probe_read(&css, sizeof(css), &css_set->subsys[0]) < 0)
+		return -1;
+
+	struct cgroup *cgrp;
+	if (bpf_probe_read(&cgrp, sizeof(cgrp), &css->cgroup) < 0)
+		return -1;
+
+	struct kernfs_node *kn;
+	if (bpf_probe_read(&kn, sizeof(kn), &cgrp->kn) < 0)
+		return -1;
+
+	const char *name;
+	if (bpf_probe_read(&name, sizeof(name), &kn->name) < 0)
+		return -1;
+
+	if (bpf_probe_read_str(buf, sz, (void *)name) < 0)
+		return -1;
+
+	return 0;
+}
+
+// TODO: replace all `bpf_probe_read` by `bpf_probe_read_kernel` once we can assume that we have at least kernel 5.5
+static int check_sock(struct pt_regs *ctx, struct sock *sk) {
+	struct stats_value zero = {.read_buffer_max_usage = 0, .write_buffer_max_usage = 0};
+
+	struct stats_key k;
+	get_cgroup_name(k.cgroup_name, sizeof(k.cgroup_name));
+
+	bpf_map_update_elem(&tcp_queue_stats, &k, &zero, BPF_NOEXIST);
+	struct stats_value *v = bpf_map_lookup_elem(&tcp_queue_stats, &k);
+	if (!v) {
+		return 0;
+	}
+
+	int rqueue_size, wqueue_size;
+	bpf_probe_read(&rqueue_size, sizeof(rqueue_size), (void *)&sk->sk_rcvbuf);
+	bpf_probe_read(&wqueue_size, sizeof(wqueue_size), (void *)&sk->sk_sndbuf);
+
+	const struct tcp_sock *tp = tcp_sk(sk);
+	u32 rcv_nxt, copied_seq, write_seq, snd_una;
+	bpf_probe_read(&rcv_nxt, sizeof(rcv_nxt), (void *)&tp->rcv_nxt);          // What we want to receive next
+	bpf_probe_read(&copied_seq, sizeof(copied_seq), (void *)&tp->copied_seq); // Head of yet unread data
+	bpf_probe_read(&write_seq, sizeof(write_seq), (void *)&tp->write_seq);    // Tail(+1) of data held in tcp send buffer
+	bpf_probe_read(&snd_una, sizeof(snd_una), (void *)&tp->snd_una);          // First byte we want an ack for
+
+	u32 rqueue = rcv_nxt < copied_seq ? 0 : rcv_nxt - copied_seq;
+	if (rqueue < 0)
+		rqueue = 0;
+	u32 wqueue = write_seq - snd_una;
+
+	u32 rqueue_usage = 1000 * rqueue / rqueue_size;
+	u32 wqueue_usage = 1000 * wqueue / wqueue_size;
+
+	if (rqueue_usage > v->read_buffer_max_usage)
+		v->read_buffer_max_usage = rqueue_usage;
+	if (wqueue_usage > v->write_buffer_max_usage)
+		v->write_buffer_max_usage = wqueue_usage;
+
+	struct queuedata qd = {};
+	bpf_get_current_comm(&qd.comm, 80);
+	qd.read_buffer_max_usage  = v->read_buffer_max_usage;
+	qd.write_buffer_max_usage = v->write_buffer_max_usage;
+	qd.rqueue_size            = rqueue_size;
+	qd.wqueue_size            = wqueue_size;
+	qd.rqueue                 = rqueue;
+	qd.wqueue                 = wqueue;
+
+	bpf_perf_event_output(ctx, &queuedatas, BPF_F_CURRENT_CPU, &qd, sizeof(qd));
+
+	return 0;
+}
+
+SEC("kprobe/tcp_recvmsg")
+int BPF_KPROBE(tcp_recvmsg) {
+	struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+	u64 pid_tgid    = bpf_get_current_pid_tgid();
+	bpf_map_update_elem(&who_recvmsg, &pid_tgid, &sk, BPF_ANY);
+
+	return check_sock(ctx, sk);
+}
+
+SEC("kretprobe/tcp_recvmsg")
+int kretprobe_tcprecvmsg(struct pt_regs *ctx) {
+	u64 pid_tgid     = bpf_get_current_pid_tgid();
+	struct sock **sk = bpf_map_lookup_elem(&who_recvmsg, &pid_tgid);
+	bpf_map_delete_elem(&who_recvmsg, &pid_tgid);
+
+	if (sk)
+		return check_sock(ctx, *sk);
+	return 0;
+}
+
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(tcp_sendmsg) {
+	struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+	u64 pid_tgid    = bpf_get_current_pid_tgid();
+	bpf_map_update_elem(&who_sendmsg, &pid_tgid, &sk, BPF_ANY);
+
+	return check_sock(ctx, sk);
+}
+
+SEC("kretprobe/tcp_sendmsg")
+int kretprobe_tcpsendmsg(struct pt_regs *ctx) {
+	u64 pid_tgid     = bpf_get_current_pid_tgid();
+	struct sock **sk = bpf_map_lookup_elem(&who_sendmsg, &pid_tgid);
+	bpf_map_delete_elem(&who_sendmsg, &pid_tgid);
+
+	if (sk)
+		return check_sock(ctx, *sk);
+	return 0;
+}
+
+// TCP Latency
 
 SEC("kprobe/tcp_connect")
 int BPF_KPROBE(tcp_connect, struct sock *sk) {

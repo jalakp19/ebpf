@@ -21,6 +21,43 @@ type bpfEvent struct {
 	Msg  [500]uint8
 }
 
+type bpfLatdata struct {
+	Comm    [80]uint8
+	DeltaUs uint64
+	TsUs    uint64
+	Sport   uint16
+	Dport   uint16
+	Saddr   uint32
+	Daddr   uint32
+	_       [4]byte
+}
+
+type bpfPiddata struct {
+	Comm [80]uint8
+	Ts   uint64
+	Tgid uint32
+	_    [4]byte
+}
+
+type bpfQueuedata struct {
+	Comm                [80]uint8
+	ReadBufferMaxUsage  uint32
+	WriteBufferMaxUsage uint32
+	RqueueSize          uint64
+	WqueueSize          uint64
+	Rqueue              uint64
+	Wqueue              uint64
+}
+
+type bpfTcpevent struct {
+	Comm  [80]uint8
+	Sport uint16
+	Dport uint16
+	Saddr uint32
+	Daddr uint32
+	Srtt  uint32
+}
+
 // loadBpf returns the embedded CollectionSpec for bpf.
 func loadBpf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfBytes)
@@ -62,15 +99,30 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
-	KprobeRecvfrom *ebpf.ProgramSpec `ebpf:"kprobe_recvfrom"`
-	KprobeSendto   *ebpf.ProgramSpec `ebpf:"kprobe_sendto"`
+	KprobeRecvfrom      *ebpf.ProgramSpec `ebpf:"kprobe_recvfrom"`
+	KprobeSendto        *ebpf.ProgramSpec `ebpf:"kprobe_sendto"`
+	KretprobeTcprecvmsg *ebpf.ProgramSpec `ebpf:"kretprobe_tcprecvmsg"`
+	KretprobeTcpsendmsg *ebpf.ProgramSpec `ebpf:"kretprobe_tcpsendmsg"`
+	TcpClose            *ebpf.ProgramSpec `ebpf:"tcp_close"`
+	TcpConnect          *ebpf.ProgramSpec `ebpf:"tcp_connect"`
+	TcpRcvStateProcess  *ebpf.ProgramSpec `ebpf:"tcp_rcv_state_process"`
+	TcpRecvmsg          *ebpf.ProgramSpec `ebpf:"tcp_recvmsg"`
+	TcpSendmsg          *ebpf.ProgramSpec `ebpf:"tcp_sendmsg"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	Events *ebpf.MapSpec `ebpf:"events"`
+	Events        *ebpf.MapSpec `ebpf:"events"`
+	Latdatas      *ebpf.MapSpec `ebpf:"latdatas"`
+	Piddatas      *ebpf.MapSpec `ebpf:"piddatas"`
+	Queuedatas    *ebpf.MapSpec `ebpf:"queuedatas"`
+	Start         *ebpf.MapSpec `ebpf:"start"`
+	TcpQueueStats *ebpf.MapSpec `ebpf:"tcp_queue_stats"`
+	Tcpevents     *ebpf.MapSpec `ebpf:"tcpevents"`
+	WhoRecvmsg    *ebpf.MapSpec `ebpf:"who_recvmsg"`
+	WhoSendmsg    *ebpf.MapSpec `ebpf:"who_sendmsg"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -92,12 +144,28 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	Events *ebpf.Map `ebpf:"events"`
+	Events        *ebpf.Map `ebpf:"events"`
+	Latdatas      *ebpf.Map `ebpf:"latdatas"`
+	Piddatas      *ebpf.Map `ebpf:"piddatas"`
+	Queuedatas    *ebpf.Map `ebpf:"queuedatas"`
+	Start         *ebpf.Map `ebpf:"start"`
+	TcpQueueStats *ebpf.Map `ebpf:"tcp_queue_stats"`
+	Tcpevents     *ebpf.Map `ebpf:"tcpevents"`
+	WhoRecvmsg    *ebpf.Map `ebpf:"who_recvmsg"`
+	WhoSendmsg    *ebpf.Map `ebpf:"who_sendmsg"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.Events,
+		m.Latdatas,
+		m.Piddatas,
+		m.Queuedatas,
+		m.Start,
+		m.TcpQueueStats,
+		m.Tcpevents,
+		m.WhoRecvmsg,
+		m.WhoSendmsg,
 	)
 }
 
@@ -105,14 +173,28 @@ func (m *bpfMaps) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
-	KprobeRecvfrom *ebpf.Program `ebpf:"kprobe_recvfrom"`
-	KprobeSendto   *ebpf.Program `ebpf:"kprobe_sendto"`
+	KprobeRecvfrom      *ebpf.Program `ebpf:"kprobe_recvfrom"`
+	KprobeSendto        *ebpf.Program `ebpf:"kprobe_sendto"`
+	KretprobeTcprecvmsg *ebpf.Program `ebpf:"kretprobe_tcprecvmsg"`
+	KretprobeTcpsendmsg *ebpf.Program `ebpf:"kretprobe_tcpsendmsg"`
+	TcpClose            *ebpf.Program `ebpf:"tcp_close"`
+	TcpConnect          *ebpf.Program `ebpf:"tcp_connect"`
+	TcpRcvStateProcess  *ebpf.Program `ebpf:"tcp_rcv_state_process"`
+	TcpRecvmsg          *ebpf.Program `ebpf:"tcp_recvmsg"`
+	TcpSendmsg          *ebpf.Program `ebpf:"tcp_sendmsg"`
 }
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
 		p.KprobeRecvfrom,
 		p.KprobeSendto,
+		p.KretprobeTcprecvmsg,
+		p.KretprobeTcpsendmsg,
+		p.TcpClose,
+		p.TcpConnect,
+		p.TcpRcvStateProcess,
+		p.TcpRecvmsg,
+		p.TcpSendmsg,
 	)
 }
 
